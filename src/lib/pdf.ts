@@ -1,0 +1,217 @@
+/**
+ * Génération des PDF dans l'application (sans internet) : documents au format de l'entreprise,
+ * feuille de salaires (pointage) et état des frais. Texte vectoriel : net à l'impression, léger, recherchable.
+ */
+import { jsPDF } from 'jspdf'
+import autoTable from 'jspdf-autotable'
+import { db, docLabels, docTotals, getCompany, lineTotal, remaining, type Client, type Company, type Doc } from './db'
+import { amountInWords, dateFr, money, qtyFmt } from './format'
+import { docRef, sumWordsLabel, totalLabel } from './docs'
+import { downloadBlob, safeFileName } from './xlsx'
+import logoUrl from '../assets/logo-sonaltech.png'
+
+const LOGO_RATIO = 211 / 1200
+let logoCache: Promise<string> | null = null
+/** Logo en data URL (disponible hors ligne : inclus dans l'application). */
+function logoData() {
+  logoCache ??= fetch(logoUrl).then((r) => r.blob()).then((b) => new Promise<string>((ok, ko) => { const fr = new FileReader(); fr.onload = () => ok(fr.result as string); fr.onerror = ko; fr.readAsDataURL(b) }))
+  return logoCache
+}
+
+const INK: [number, number, number] = [11, 31, 51]
+const HEAD: [number, number, number] = [197, 211, 232]
+const M = 12            // marge (mm)
+const W = 210 - 2 * M   // largeur utile
+
+export const pdfName = (d: Doc) => `Sonaltech Électrique - ${docLabels[d.type].one} ${docRef(d).replace('/', '-')}.pdf`
+
+/** Les espaces fines (milliers) ne sont pas dans les polices PDF standard */
+const t = (s: string | number | undefined | null) => String(s ?? '').replace(/[\u202f\u00a0]/g, ' ')
+
+/** Cadre autour de chaque page ; aucun texte en bas de page (seulement le n° de page s'il y en a plusieurs). */
+function frame(pdf: jsPDF) {
+  const n = pdf.getNumberOfPages()
+  for (let i = 1; i <= n; i++) {
+    pdf.setPage(i)
+    const pw = pdf.internal.pageSize.getWidth(), ph = pdf.internal.pageSize.getHeight()
+    pdf.setDrawColor(40); pdf.setLineWidth(0.6); pdf.rect(5, 5, pw - 10, ph - 10)
+    if (n > 1) { pdf.setFont('helvetica', 'normal'); pdf.setFontSize(8); pdf.setTextColor(120); pdf.text(`${i} / ${n}`, pw - 9, ph - 7.5, { align: 'right' }) }
+  }
+}
+
+async function header(pdf: jsPDF) {
+  const w = 150, h = w * LOGO_RATIO
+  pdf.addImage(await logoData(), 'PNG', 105 - w / 2, 7, w, h, 'logo', 'FAST')
+}
+
+export async function buildDocPdf(doc: Doc, given?: { company?: Company; client?: Client; chantierName?: string }): Promise<jsPDF> {
+  const company = given?.company ?? await getCompany()
+  const client = given?.client ?? (doc.clientId ? await db.clients.get(doc.clientId) : undefined)
+  const chantierName = given?.chantierName ?? (doc.chantierId ? (await db.chantiers.get(doc.chantierId))?.name : undefined)
+  const tot = docTotals(doc)
+  const pdf = new jsPDF({ unit: 'mm', format: 'a4', compress: true })
+  pdf.setProperties({ title: pdfName(doc).replace('.pdf', ''), author: company.name, creator: `${company.name} — Gestion` })
+  await header(pdf)
+
+  // N° et date
+  pdf.setFont('helvetica', 'bold'); pdf.setFontSize(11); pdf.setTextColor(0)
+  pdf.text(`${docLabels[doc.type].title} : ${docRef(doc)}`, M + 18, 39)
+  pdf.text(`Date : ${dateFr(doc.date)}`, 210 - M - 18, 39, { align: 'right' })
+
+  // Cadres entreprise / client
+  const half = W / 2, top = 43, lh = 4.6
+  const left: [string, string, boolean?][] = [[company.legalName, '', true], ['Activité', company.activity], ['Adresse', company.address],
+    ...(company.rc ? [['RC', company.rc] as [string, string]] : []), ...(company.art ? [['ART', company.art] as [string, string]] : []),
+    ...(company.nif ? [['NIF', company.nif] as [string, string]] : []), ...(company.nis ? [['NIS', company.nis] as [string, string]] : [])]
+  const right: [string, string][] = [['A', client?.name ?? ''], ['Adresse', client?.address ?? ''], ['Activité', client?.activity ?? ''], ['RC', client?.rc ?? ''], ['ART', client?.art ?? ''], ['NIF', client?.nif ?? '']]
+  const writeCol = (rows: [string, string, boolean?][], x: number, maxW: number) => {
+    let y = top + 5
+    for (const [k, v, title] of rows) {
+      pdf.setFontSize(9)
+      if (title) { pdf.setFont('helvetica', 'bold'); pdf.text(t(k.toUpperCase()), x, y); y += lh; continue }
+      pdf.setFont('helvetica', 'bold'); pdf.setTextColor(0); const label = `${k} : `; pdf.text(label, x, y)
+      const lw = pdf.getTextWidth(label); pdf.setTextColor(70); pdf.setFont('helvetica', 'normal')
+      const lines = pdf.splitTextToSize(t(k === 'A' ? v.toUpperCase() : v), maxW - lw) as string[]
+      pdf.text(lines.length ? lines : [''], x + lw + (k === 'A' ? 6 : 0), y); y += lh * Math.max(1, lines.length)
+    }
+    return y
+  }
+  const yl = writeCol(left, M + 3, half - 6), yr = writeCol(right, M + half + 3, half - 6)
+  const telY = Math.max(yl, yr) + 2
+  for (const [x, v] of [[M + 3, company.phone], [M + half + 3, client?.phone ?? '']] as [number, string][]) {
+    pdf.setFont('helvetica', 'bold'); pdf.setTextColor(0); pdf.text('Téléphone : ', x, telY)
+    const lw = pdf.getTextWidth('Téléphone : ')
+    pdf.setTextColor(70); pdf.setFont('helvetica', 'normal'); pdf.text(t(v), x + lw, telY)
+    pdf.setTextColor(0)
+  }
+  const boxBottom = telY + 3
+  pdf.setDrawColor(60); pdf.setLineWidth(0.3); pdf.rect(M, top, W, boxBottom - top); pdf.line(M + half, top, M + half, boxBottom)
+
+  let y = boxBottom + 6
+  const objet = [doc.object, chantierName && !doc.object.includes(chantierName) ? `Chantier : ${chantierName}` : ''].filter(Boolean).join(' — ')
+  if (objet) {
+    pdf.setFontSize(10); pdf.setFont('helvetica', 'bold'); pdf.text('Objet : ', M, y)
+    pdf.setFont('helvetica', 'normal'); const lines = pdf.splitTextToSize(t(objet), W - 16) as string[]
+    pdf.text(lines, M + pdf.getTextWidth('Objet : '), y); y += 4.5 * lines.length + 2
+  }
+
+  // Attachement : quantités seulement
+  if (doc.type === 'attachement') {
+    autoTable(pdf, {
+      startY: y, margin: { left: M, right: M, top: 14, bottom: 14 },
+      head: [['Description', 'U', 'Qté contrat', 'Qté réalisée', 'Qté reste à réaliser']],
+      body: doc.lines.map((l) => [t(l.designation), t(l.unit), t(qtyFmt(l.contractQty ?? 0)), t(qtyFmt(l.qty || 0)), t(qtyFmt(remaining(l)))]),
+      theme: 'grid',
+      styles: { font: 'helvetica', fontSize: 9, cellPadding: 1.4, lineColor: [60, 60, 60], lineWidth: 0.2, textColor: 0, valign: 'middle' },
+      headStyles: { fillColor: HEAD, textColor: 0, fontStyle: 'bold', halign: 'center' },
+      columnStyles: {
+        0: { cellWidth: W * 0.5, fontStyle: 'bold' },
+        1: { cellWidth: W * 0.08, halign: 'center' }, 2: { cellWidth: W * 0.14, halign: 'center' },
+        3: { cellWidth: W * 0.15, halign: 'center' }, 4: { cellWidth: W * 0.13, halign: 'center', fontStyle: 'bold' },
+      },
+    })
+    y = (pdf as jsPDF & { lastAutoTable: { finalY: number } }).lastAutoTable.finalY + 16
+    if (y > 270) { pdf.addPage(); y = 25 }
+    pdf.setFont('helvetica', 'bolditalic'); pdf.setFontSize(10.5); pdf.setTextColor(0)
+    for (const [label, x] of [['ENTREPRISE', M + W * 0.78]] as [string, number][]) {
+      pdf.text(label, x, y, { align: 'center' }); const w = pdf.getTextWidth(label); pdf.setLineWidth(0.3); pdf.line(x - w / 2, y + 0.8, x + w / 2, y + 0.8)
+    }
+    frame(pdf)
+    return pdf
+  }
+
+  // Tableau des lignes
+  autoTable(pdf, {
+    startY: y, margin: { left: M, right: M, top: 14, bottom: 14 },
+    head: [['Description', 'U', 'PU HT', 'Quantité', 'Montant HT']],
+    body: doc.lines.map((l) => [t(l.designation), t(l.unit), t(money(l.price)), t(qtyFmt(l.qty)), t(money(lineTotal(l)))]),
+    theme: 'grid',
+    styles: { font: 'helvetica', fontSize: 9, cellPadding: 1.4, lineColor: [60, 60, 60], lineWidth: 0.2, textColor: 0, valign: 'middle' },
+    headStyles: { fillColor: HEAD, textColor: 0, fontStyle: 'bold', halign: 'center' },
+    columnStyles: {
+      0: { cellWidth: W * 0.52, fontStyle: 'bold' },
+      1: { cellWidth: W * 0.05, halign: 'center' }, 2: { cellWidth: W * 0.13, halign: 'right' },
+      3: { cellWidth: W * 0.12, halign: 'center' }, 4: { cellWidth: W * 0.18, halign: 'right' },
+    },
+  })
+  y = (pdf as jsPDF & { lastAutoTable: { finalY: number } }).lastAutoTable.finalY + 6
+  if (y > 240) { pdf.addPage(); y = 20 }
+
+  // Règlement et totaux
+  pdf.setFont('helvetica', 'bold'); pdf.setFontSize(10); pdf.text(t(`Mode de règlement : ${doc.paymentMode.toUpperCase()}`), M, y + 4)
+  // Un seul total (pas de TVA)
+  const lw = W * 0.2, vw = W * 0.2, tx = 210 - M - lw - vw, rh = doc.type === 'facture' ? 7 : 8
+  const totalRows: [string, string][] = doc.type === 'facture'
+    ? [['TOTAL HT', money(tot.ht)], [`TVA ${String(doc.vatRate || 0).padStart(2, '0')} %`, money(tot.vat)], ['TOTAL TTC', money(tot.ttc)]]
+    : [[totalLabel(doc.type), money(tot.ttc)]]
+  pdf.setFontSize(doc.type === 'facture' ? 10.5 : 11)
+  totalRows.forEach(([label, value], i) => {
+    const ry = y + i * rh
+    pdf.setFillColor(...HEAD); pdf.rect(tx, ry, lw, rh, 'FD'); pdf.text(label, tx + lw / 2, ry + rh / 2 + 1.5, { align: 'center' })
+    pdf.rect(tx + lw, ry, vw, rh); pdf.text(t(value), 210 - M - 2, ry + rh / 2 + 1.5, { align: 'right' })
+  })
+  y += totalRows.length * rh + 10
+
+  // Somme en lettres
+  pdf.setFontSize(10); pdf.setFont('helvetica', 'normal')
+  const lead = `${sumWordsLabel[doc.type]} : `
+  pdf.text(lead, M, y)
+  pdf.setFont('helvetica', 'bold')
+  const words = pdf.splitTextToSize(t(`${amountInWords(tot.ttc)}.`), W - pdf.getTextWidth(lead)) as string[]
+  pdf.text(words, M + pdf.getTextWidth(lead), y); y += 5 * words.length + 10
+
+  // Signatures
+  pdf.setFont('helvetica', 'bolditalic'); pdf.setFontSize(10.5)
+  const sign = (label: string, x: number) => { pdf.text(label, x, y, { align: 'center' }); const w = pdf.getTextWidth(label); pdf.setLineWidth(0.3); pdf.line(x - w / 2, y + 0.8, x + w / 2, y + 0.8) }
+  if (doc.type === 'devis') sign('LE CLIENT (bon pour accord)', M + W * 0.22)
+  sign('ENTREPRISE', M + W * 0.78)
+
+  frame(pdf)
+  return pdf
+}
+
+export async function downloadDocPdf(doc: Doc) {
+  downloadBlob((await buildDocPdf(doc)).output('blob'), pdfName(doc))
+}
+
+/** Ouvre le PDF dans un nouvel onglet (lecture / impression). */
+export async function openDocPdf(doc: Doc) {
+  const win = window.open('', '_blank')
+  const url = URL.createObjectURL((await buildDocPdf(doc)).output('blob'))
+  if (win) win.location.href = url
+  else downloadBlob(await fetch(url).then((r) => r.blob()), pdfName(doc))
+  setTimeout(() => URL.revokeObjectURL(url), 60_000)
+}
+
+/** Simple tableau en PDF (pointage / salaires, frais). */
+export async function tablePdf(opts: { title: string; subtitle?: string; head: string[]; body: (string | number)[][]; foot?: (string | number)[]; align?: ('left' | 'right' | 'center')[]; company: Company; landscape?: boolean; fileName: string }) {
+  const pdf = new jsPDF({ unit: 'mm', format: 'a4', orientation: opts.landscape ? 'landscape' : 'portrait', compress: true })
+  pdf.addImage(await logoData(), 'PNG', M, 6, 80, 80 * LOGO_RATIO, 'logo', 'FAST')
+  pdf.setFont('helvetica', 'bold'); pdf.setFontSize(13); pdf.setTextColor(...INK); pdf.text(t(opts.title), M, 27)
+  if (opts.subtitle) { pdf.setFont('helvetica', 'normal'); pdf.setFontSize(9); pdf.setTextColor(90); pdf.text(t(opts.subtitle), M, 32) }
+  const columnStyles = Object.fromEntries((opts.align ?? []).map((a, i) => [i, { halign: a }]))
+  autoTable(pdf, {
+    startY: opts.subtitle ? 36 : 31, margin: { left: M, right: M, top: 14, bottom: 14 },
+    head: [opts.head.map(t)], body: opts.body.map((r) => r.map(t)), foot: opts.foot ? [opts.foot.map(t)] : undefined,
+    didParseCell: (h) => { if (h.section === 'foot' && opts.align?.[h.column.index]) h.cell.styles.halign = opts.align[h.column.index] },
+    theme: 'grid', styles: { fontSize: opts.landscape ? 7 : 8.5, cellPadding: 1.2, lineColor: [150, 150, 150], lineWidth: 0.15, textColor: 0 },
+    headStyles: { fillColor: HEAD, textColor: 0, fontStyle: 'bold' }, footStyles: { fillColor: [240, 243, 246], textColor: 0, fontStyle: 'bold' },
+    columnStyles,
+  })
+  frame(pdf)
+  downloadBlob(pdf.output('blob'), opts.fileName)
+}
+
+/** Toutes les factures / devis… d'une période dans un seul fichier ZIP de PDF. */
+export async function zipPdfs(docs: Doc[], fileName: string, onProgress?: (n: number) => void) {
+  const { zip } = await import('./zip')
+  const company = await getCompany()
+  const clients = await db.clients.toArray(), chantiers = await db.chantiers.toArray()
+  const files: { name: string; data: Uint8Array }[] = []
+  for (const [i, d] of docs.entries()) {
+    const pdf = await buildDocPdf(d, { company, client: clients.find((c) => c.id === d.clientId), chantierName: chantiers.find((c) => c.id === d.chantierId)?.name })
+    files.push({ name: `${docLabels[d.type].many}/${safeFileName(pdfName(d))}`, data: new Uint8Array(pdf.output('arraybuffer')) })
+    onProgress?.(i + 1)
+  }
+  downloadBlob(new Blob([zip(files)], { type: 'application/zip' }), fileName)
+}
