@@ -1,4 +1,4 @@
-# Soneltheque — site Sonaltech Électrique (public + gestion)
+# Sonaltech Électrique — site public et espace de gestion
 
 Un seul projet, deux parties :
 
@@ -13,7 +13,7 @@ Un seul projet, deux parties :
 
 ## Déploiement sur Vercel (gratuit)
 
-1. vercel.com/new → importer le dépôt GitHub `soneltheque` → **Deploy** (réglages détectés automatiquement).
+1. vercel.com/new → importer le dépôt GitHub du projet → **Deploy** (réglages détectés automatiquement).
 2. Projet → **Storage** → **Create Database** → **Neon** (Postgres, région Frankfurt, offre Free) → **Connect** au projet. Cela crée `DATABASE_URL`.
 3. Projet → **Settings → Environment Variables** → `APP_PASSWORD` = le mot de passe de l'espace de gestion (10 caractères minimum).
 4. **Deployments** → … → **Redeploy**.
