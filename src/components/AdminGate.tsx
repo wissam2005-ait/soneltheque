@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react'
 import { Icon } from './icons'
-import { isFileVersion, isLoggedIn, login } from '../lib/sync'
+import { isFileVersion, isLoggedIn, login, useSyncStatus } from '../lib/sync'
 import logoUrl from '../assets/logo-sonaltech.png'
 
 const features = [
@@ -14,7 +14,10 @@ const features = [
  * Version fichier (clé USB) : accès direct, la connexion au site reste facultative.
  */
 export default function AdminGate({ children }: { children: ReactNode }) {
-  const [ok, setOk] = useState(() => isFileVersion() || isLoggedIn())
+  const status = useSyncStatus()
+  const [, refresh] = useState(0)
+  const ok = isFileVersion() || (isLoggedIn() && status.state !== 'login')
+  const changed = status.state === 'login' && status.message === 'Reconnectez-vous.'
   const [password, setPassword] = useState('')
   const [show, setShow] = useState(false)
   const [error, setError] = useState('')
@@ -52,10 +55,11 @@ export default function AdminGate({ children }: { children: ReactNode }) {
             <span className="grid h-14 w-14 place-items-center rounded-2xl bg-flash/10 text-flash"><Icon name="shield" size={28} /></span>
             <h1 className="mt-5 text-3xl font-bold text-ink">Connexion</h1>
             <p className="mt-1 text-ink/60">Entrez le mot de passe de l’entreprise pour accéder à la gestion.</p>
+            {changed && <p className="mt-4 rounded-lg bg-[#fff4d6] p-3 text-sm text-[#6b4e00]">Le mot de passe a été changé : reconnectez-vous avec le nouveau.</p>}
 
             <form className="mt-7" onSubmit={async (e) => {
               e.preventDefault(); setError(''); setBusy(true)
-              try { await login(password); setOk(true) } catch (err) {
+              try { await login(password); setPassword(''); refresh((n) => n + 1) } catch (err) {
                 setError((err as Error).message === 'Failed to fetch' ? 'Pas de connexion internet : la première connexion en a besoin.' : (err as Error).message)
                 setPassword('')
               } finally { setBusy(false) }
